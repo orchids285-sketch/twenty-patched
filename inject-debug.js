@@ -1,5 +1,10 @@
-// Safer instrumentation: wrap the whole streamChat method body in try/catch
-// + log entry/exit. Also patches getToolsByName timeout.
+// Twenty patch injector:
+//  1. Wrap streamChat body with try/catch + 5s ticker → see hangs/errors
+//  2. Add checkpoint logs around major awaits
+//  3. MUTATE tool schemas in-place to remove $defs / $ref (Gemini compat)
+//     — Preserves Zod/SDK validator prototypes (we don't copy properties)
+//     — Walks every possible schema location: inputSchema, inputSchema.jsonSchema,
+//       parameters, outputSchema, outputSchema.jsonSchema
 const fs = require('fs');
 const path = process.argv[2];
 if (!path) { console.error('usage: node inject-debug.js <path>'); process.exit(1); }
@@ -8,14 +13,6 @@ let src = fs.readFileSync(path, 'utf-8');
 const before = src.length;
 
 // 1. Wrap streamChat method body in try/catch with full error logging.
-// Compiled JS pattern: `async streamChat({...}) { ...body... }`
-// We use a marker comment as a needle. Compiled NestJS typically has the
-// method as: `streamChat(opts) { return __awaiter(...) }` (TS downlevel)
-// OR `async streamChat({...}) { ... }`. Search for 'streamChat(' in fn def.
-
-// Find the first occurrence of 'streamChat(' that's a method definition.
-// Then locate the matching opening brace and inject a wrapper.
-
 const methodMatch = src.match(/(\basync\s+streamChat\s*\([^)]*\)\s*\{)/);
 if (methodMatch) {
   const insertAt = methodMatch.index + methodMatch[0].length;
@@ -28,7 +25,6 @@ if (methodMatch) {
       }, 5000);
       try {`;
   src = src.slice(0, insertAt) + inject + src.slice(insertAt);
-  // Now find the matching closing brace of the method and inject finally
   let depth = 1;
   let i = insertAt + inject.length;
   while (i < src.length && depth > 0) {
@@ -48,15 +44,10 @@ if (methodMatch) {
   `;
     src = src.slice(0, i) + closeInject + src.slice(i);
     console.log('[inject] wrapped streamChat with try/catch + 5s ticker');
-  } else {
-    console.log('[inject] WARN: could not find streamChat closing brace');
   }
-} else {
-  console.log('[inject] WARN: could not find async streamChat method definition');
 }
 
-// 2. After "Built tool catalog" log, add checkpoint markers for each major await
-//    using a safe pattern: insert BEFORE 'const X = await ...' lines
+// 2. Checkpoint logs around major awaits
 const checkpoints = [
   /(const\s+\w+\s*=\s*await\s+this\.toolRegistry\.getToolsByName)/,
   /(const\s+\w+\s*=\s*await\s+this\.aiModelRegistryService\.resolveModelForAgent)/,
@@ -69,95 +60,122 @@ checkpoints.forEach((re, idx) => {
   const log = `console.log("[TwentyAgent CKPT-${idx + 1} before ${labels[idx]}]");`;
   const replaced = src.replace(re, (m) => `${log} ${m}`);
   if (replaced !== src) { src = replaced; n++; console.log('[inject] CKPT-' + (idx + 1) + ' ' + labels[idx]); }
-  else console.log('[inject] SKIPPED CKPT-' + (idx + 1) + ' ' + labels[idx]);
 });
 
-// 3. INLINE $defs in tool schemas before passing to streamText.
-//    Gemini rejects "$ref": "#/$defs/X" references — we walk each tool's
-//    inputSchema, resolve any $ref against $defs, and strip the top-level
-//    $defs block. This keeps tools functional (find_people, create_record,
-//    etc.) instead of stripping them entirely.
+// 3. In-place tool-schema flattener. Mutates schemas to remove $defs / $ref so
+//    Gemini accepts them. Preserves wrapper objects + validators since we
+//    don't copy/clone — we only mutate the underlying JSON Schema.
 const inlinerHelper = `
-// --- TwentyPatch: inline $defs in tool schemas (Gemini compat) ---
-// Only operates on PLAIN JSON Schema objects — leaves Zod schemas and
-// SDK-wrapped schemas alone (those have prototype methods .parse/.safeParse
-// that get destroyed by Object spread / for-in copy).
-function __twentyIsPlainJsonSchema(s) {
-  if (!s || typeof s !== 'object') return false;
-  if (Array.isArray(s)) return false;
-  // Zod: has _def
-  if (s._def !== undefined) return false;
-  // AI SDK Schema: has .jsonSchema or .validate as functions
-  if (typeof s.parse === 'function' || typeof s.safeParse === 'function') return false;
-  if (typeof s.validate === 'function') return false;
-  // Not a plain {} literal? Skip.
-  if (Object.getPrototypeOf(s) !== Object.prototype) return false;
-  return true;
-}
-function __twentyInlineDefs(schema, defs) {
-  if (!__twentyIsPlainJsonSchema(schema)) return schema;
-  // Resolve $ref against $defs
+// --- TwentyPatch: in-place $defs flattener for Gemini compat ---
+function __twentyResolveDefs(schema, defs, seen) {
+  if (!schema || typeof schema !== 'object') return;
+  if (Array.isArray(schema)) {
+    for (var i = 0; i < schema.length; i++) __twentyResolveDefs(schema[i], defs, seen);
+    return;
+  }
+  // Skip non-plain-object references like Zod schemas (we never reach them
+  // because we only call this on the raw JSON schema body, but be safe).
   if (typeof schema.$ref === 'string') {
-    var m = schema.$ref.match(/^#\\/\\$defs\\/(.+)$/);
+    var m = schema.$ref.match(/^#\\/\\$defs\\/(.+)$/) || schema.$ref.match(/^#\\/definitions\\/(.+)$/);
     if (m && defs && defs[m[1]]) {
-      return __twentyInlineDefs(defs[m[1]], defs);
+      var seenKey = m[1];
+      if (seen[seenKey]) {
+        // Circular reference: replace with a permissive object schema to avoid recursion
+        delete schema.$ref;
+        schema.type = 'object';
+        return;
+      }
+      seen[seenKey] = true;
+      var target = defs[m[1]];
+      delete schema.$ref;
+      // Copy target properties into this schema
+      for (var tk in target) schema[tk] = target[tk];
+      // Recurse into the now-merged schema
+      __twentyResolveDefs(schema, defs, seen);
+      seen[seenKey] = false;
+      return;
     }
   }
-  var out = {};
   for (var k in schema) {
     if (k === '$defs' || k === 'definitions') continue;
     var v = schema[k];
-    if (Array.isArray(v)) {
-      out[k] = v.map(function (x) { return __twentyInlineDefs(x, defs); });
-    } else if (__twentyIsPlainJsonSchema(v)) {
-      out[k] = __twentyInlineDefs(v, defs);
-    } else {
-      out[k] = v;
-    }
+    if (v && typeof v === 'object') __twentyResolveDefs(v, defs, seen);
   }
-  return out;
 }
+
+function __twentyFlattenSchema(schema) {
+  if (!schema || typeof schema !== 'object') return;
+  var defs = schema.$defs || schema.definitions;
+  if (defs) {
+    __twentyResolveDefs(schema, defs, {});
+    delete schema.$defs;
+    delete schema.definitions;
+  } else {
+    // No top-level defs but may still have nested $refs — try with empty defs
+    // to at least walk the tree (no-op if no refs)
+    __twentyResolveDefs(schema, {}, {});
+  }
+}
+
 function __twentyFlattenToolSchemas(tools) {
   if (!tools || typeof tools !== 'object') return tools;
-  var out = {};
-  var n = 0;
+  var flattenedCount = 0;
+  var total = 0;
   for (var name in tools) {
     var t = tools[name];
-    if (t && typeof t === 'object' && __twentyIsPlainJsonSchema(t.inputSchema)) {
-      var defs = t.inputSchema.$defs || t.inputSchema.definitions || {};
-      if (Object.keys(defs).length > 0 || JSON.stringify(t.inputSchema).indexOf('"$ref"') >= 0) {
-        var flat = __twentyInlineDefs(t.inputSchema, defs);
-        out[name] = Object.assign({}, t, { inputSchema: flat });
-        n++;
-        continue;
+    if (!t || typeof t !== 'object') continue;
+    total++;
+    // Schemas live in several possible places depending on how the tool was built
+    var schemas = [];
+    if (t.inputSchema) {
+      if (typeof t.inputSchema === 'object') schemas.push(t.inputSchema);
+      // Vercel AI SDK Schema wrapper: { jsonSchema: {...}, validate, ... }
+      if (t.inputSchema.jsonSchema && typeof t.inputSchema.jsonSchema === 'object') schemas.push(t.inputSchema.jsonSchema);
+    }
+    if (t.outputSchema) {
+      if (typeof t.outputSchema === 'object') schemas.push(t.outputSchema);
+      if (t.outputSchema.jsonSchema && typeof t.outputSchema.jsonSchema === 'object') schemas.push(t.outputSchema.jsonSchema);
+    }
+    if (t.parameters) {
+      if (typeof t.parameters === 'object') schemas.push(t.parameters);
+      if (t.parameters.jsonSchema && typeof t.parameters.jsonSchema === 'object') schemas.push(t.parameters.jsonSchema);
+    }
+    var touched = false;
+    for (var s = 0; s < schemas.length; s++) {
+      var sch = schemas[s];
+      // Only mutate plain JSON Schema bodies — never Zod (has _def) or wrappers
+      if (sch._def !== undefined) continue;
+      if (typeof sch.parse === 'function' || typeof sch.safeParse === 'function') continue;
+      try {
+        var jsonStr = JSON.stringify(sch);
+        if (jsonStr && (jsonStr.indexOf('"$ref"') >= 0 || jsonStr.indexOf('"$defs"') >= 0 || jsonStr.indexOf('"definitions"') >= 0)) {
+          __twentyFlattenSchema(sch);
+          touched = true;
+        }
+      } catch (e) {
+        // Circular or unstringifiable — skip
       }
     }
-    out[name] = t;
+    if (touched) flattenedCount++;
   }
-  console.log("[TwentyPatch] flattened $defs in " + n + "/" + Object.keys(tools).length + " tool schemas");
-  return out;
+  console.log("[TwentyPatch] flattened in-place: " + flattenedCount + "/" + total + " tool schemas");
+  return tools; // SAME object, mutated
 }
 // --- end TwentyPatch helper ---
 `;
 
-// Insert helper at the top of the file (after the first "use strict" or after imports)
 src = inlinerHelper + src;
 
-// Replace tools: activeTools with empty {} — Vercel AI SDK + Gemini have an
-// open incompatibility with $defs references in tool input/output schemas
-// that we cannot fix without patching the SDK itself. Empty tools => the
-// model answers conversationally without trying tool calls => no error.
-// Tradeoff: model can't directly find/create CRM records via chat;
-// user reads/edits records via the UI as usual.
-const toolsStripped = src.replace(
+// Wrap tools: activeTools with the flattener (mutates in place, returns same obj)
+const wrapped = src.replace(
   /tools:\s*activeTools\s*,/g,
-  'tools: {}, /* stripped: Vercel SDK + Gemini $defs incompat */'
+  'tools: __twentyFlattenToolSchemas(activeTools),'
 );
-if (toolsStripped !== src) {
-  src = toolsStripped;
-  console.log('[inject] stripped tools: activeTools (SDK+Gemini $defs incompat)');
+if (wrapped !== src) {
+  src = wrapped;
+  console.log('[inject] wrapped tools: activeTools with __twentyFlattenToolSchemas');
 } else {
-  console.log('[inject] WARN: could not find tools:activeTools to strip');
+  console.log('[inject] WARN: could not find tools:activeTools to wrap');
 }
 
 fs.writeFileSync(path, src);
