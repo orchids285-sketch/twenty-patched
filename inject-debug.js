@@ -143,16 +143,21 @@ function __twentyFlattenToolSchemas(tools) {
 // Insert helper at the top of the file (after the first "use strict" or after imports)
 src = inlinerHelper + src;
 
-// Replace tools: activeTools with the flattened version
-const toolsFlattened = src.replace(
+// Replace tools: activeTools with empty {} — Vercel AI SDK + Gemini have an
+// open incompatibility with $defs references in tool input/output schemas
+// that we cannot fix without patching the SDK itself. Empty tools => the
+// model answers conversationally without trying tool calls => no error.
+// Tradeoff: model can't directly find/create CRM records via chat;
+// user reads/edits records via the UI as usual.
+const toolsStripped = src.replace(
   /tools:\s*activeTools\s*,/g,
-  'tools: __twentyFlattenToolSchemas(activeTools),'
+  'tools: {}, /* stripped: Vercel SDK + Gemini $defs incompat */'
 );
-if (toolsFlattened !== src) {
-  src = toolsFlattened;
-  console.log('[inject] wrapped tools: activeTools with __twentyFlattenToolSchemas');
+if (toolsStripped !== src) {
+  src = toolsStripped;
+  console.log('[inject] stripped tools: activeTools (SDK+Gemini $defs incompat)');
 } else {
-  console.log('[inject] WARN: could not find tools:activeTools to wrap');
+  console.log('[inject] WARN: could not find tools:activeTools to strip');
 }
 
 fs.writeFileSync(path, src);
