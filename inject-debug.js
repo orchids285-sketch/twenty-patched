@@ -79,21 +79,41 @@ checkpoints.forEach((re, idx) => {
 //    etc.) instead of stripping them entirely.
 const inlinerHelper = `
 // --- TwentyPatch: inline $defs in tool schemas (Gemini compat) ---
+// Only operates on PLAIN JSON Schema objects — leaves Zod schemas and
+// SDK-wrapped schemas alone (those have prototype methods .parse/.safeParse
+// that get destroyed by Object spread / for-in copy).
+function __twentyIsPlainJsonSchema(s) {
+  if (!s || typeof s !== 'object') return false;
+  if (Array.isArray(s)) return false;
+  // Zod: has _def
+  if (s._def !== undefined) return false;
+  // AI SDK Schema: has .jsonSchema or .validate as functions
+  if (typeof s.parse === 'function' || typeof s.safeParse === 'function') return false;
+  if (typeof s.validate === 'function') return false;
+  // Not a plain {} literal? Skip.
+  if (Object.getPrototypeOf(s) !== Object.prototype) return false;
+  return true;
+}
 function __twentyInlineDefs(schema, defs) {
-  if (!schema || typeof schema !== 'object') return schema;
-  if (Array.isArray(schema)) return schema.map(function (x) { return __twentyInlineDefs(x, defs); });
+  if (!__twentyIsPlainJsonSchema(schema)) return schema;
   // Resolve $ref against $defs
   if (typeof schema.$ref === 'string') {
     var m = schema.$ref.match(/^#\\/\\$defs\\/(.+)$/);
     if (m && defs && defs[m[1]]) {
-      // Inline the referenced def (recursively resolve in case of chains)
       return __twentyInlineDefs(defs[m[1]], defs);
     }
   }
   var out = {};
   for (var k in schema) {
     if (k === '$defs' || k === 'definitions') continue;
-    out[k] = __twentyInlineDefs(schema[k], defs);
+    var v = schema[k];
+    if (Array.isArray(v)) {
+      out[k] = v.map(function (x) { return __twentyInlineDefs(x, defs); });
+    } else if (__twentyIsPlainJsonSchema(v)) {
+      out[k] = __twentyInlineDefs(v, defs);
+    } else {
+      out[k] = v;
+    }
   }
   return out;
 }
@@ -103,16 +123,18 @@ function __twentyFlattenToolSchemas(tools) {
   var n = 0;
   for (var name in tools) {
     var t = tools[name];
-    if (t && typeof t === 'object' && t.inputSchema && typeof t.inputSchema === 'object') {
+    if (t && typeof t === 'object' && __twentyIsPlainJsonSchema(t.inputSchema)) {
       var defs = t.inputSchema.$defs || t.inputSchema.definitions || {};
-      var flat = __twentyInlineDefs(t.inputSchema, defs);
-      out[name] = Object.assign({}, t, { inputSchema: flat });
-      n++;
-    } else {
-      out[name] = t;
+      if (Object.keys(defs).length > 0 || JSON.stringify(t.inputSchema).indexOf('"$ref"') >= 0) {
+        var flat = __twentyInlineDefs(t.inputSchema, defs);
+        out[name] = Object.assign({}, t, { inputSchema: flat });
+        n++;
+        continue;
+      }
     }
+    out[name] = t;
   }
-  console.log("[TwentyPatch] flattened $defs in " + n + " tool schemas");
+  console.log("[TwentyPatch] flattened $defs in " + n + "/" + Object.keys(tools).length + " tool schemas");
   return out;
 }
 // --- end TwentyPatch helper ---
