@@ -56,8 +56,59 @@ if [ -n "$FRONT_INDEX" ]; then
   echo "=== Patching frontend index.html: $FRONT_INDEX ==="
   # Idempotent: only inject if our marker isn't already there
   if ! grep -q "twenty-patched-ui" "$FRONT_INDEX"; then
-    sed -i 's|</head>|<style id="twenty-patched-ui">a[href*="docs.twenty.com"]{display:none!important}a[href*="docs.twenty.com"] *{display:none!important}[class*="ApiKeysAndWebhooks"] img,[class*="SettingsApiKeys"] img,div[class*="EmptyState"] img,div[class*="Illustration"] img{display:none!important}</style></head>|' "$FRONT_INDEX"
-    echo "Injected CSS into $FRONT_INDEX"
+    # JS walker is more robust than CSS since Twenty uses <button> for the
+    # Documentation entry in the settings sidebar (no href to hook on).
+    cat >/tmp/inject_block.html <<'HTML'
+<style id="twenty-patched-ui">
+a[href*="docs.twenty.com"]{display:none!important}
+a[href*="docs.twenty.com"] *{display:none!important}
+[class*="ApiKeysAndWebhooks"] img,[class*="SettingsApiKeys"] img,
+div[class*="EmptyState"] img,div[class*="Illustration"] img,
+section[class*="Documentation"] img,
+[class*="DocumentationSection"] img,
+[class*="apiDocumentation"] img,
+[class*="ApiKeysPlayground"] img{display:none!important}
+</style>
+<script id="twenty-patched-js">
+(function(){
+  function hideDocs(){
+    try{
+      // Sidebar "Documentation" button + link
+      document.querySelectorAll('a,button').forEach(function(el){
+        var t=(el.textContent||'').trim().toLowerCase();
+        if(t==='documentation'){ el.style.display='none'; }
+      });
+      // Any img inside an "API & Webhooks" page section that looks like
+      // an empty-state/illustration (catch-all for unknown class names)
+      document.querySelectorAll('[data-testid*="settings-api"], main, section').forEach(function(sec){
+        sec.querySelectorAll('img').forEach(function(img){
+          var src=(img.getAttribute('src')||'').toLowerCase();
+          if(src.indexOf('illustration')>=0||src.indexOf('empty')>=0||src.indexOf('docs')>=0||src.indexOf('placeholder')>=0){
+            img.style.display='none';
+          }
+        });
+      });
+    }catch(e){}
+  }
+  // Run on DOM ready + on every navigation
+  if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',hideDocs);}else{hideDocs();}
+  // SPA: rerun on each click and a periodic safety tick
+  document.addEventListener('click', function(){ setTimeout(hideDocs, 300); }, true);
+  setInterval(hideDocs, 2000);
+})();
+</script>
+HTML
+    # Awk-insert the file contents right before </head>
+    awk -v blockfile="/tmp/inject_block.html" '
+      /<\/head>/ && !done {
+        while ((getline line < blockfile) > 0) print line
+        close(blockfile)
+        done=1
+      }
+      { print }
+    ' "$FRONT_INDEX" > "$FRONT_INDEX.new" && mv "$FRONT_INDEX.new" "$FRONT_INDEX"
+    rm -f /tmp/inject_block.html
+    echo "Injected CSS + JS into $FRONT_INDEX"
   else
     echo "CSS already present, skipping"
   fi
