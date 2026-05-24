@@ -45,4 +45,24 @@ if [ -n "$GOOGLE_INDEX" ]; then
   node /tmp/patch-google.js "$GOOGLE_INDEX" || true
 fi
 
+# UI cleanup: hide Documentation link in side panel + the empty-state
+# illustration on /settings/api-webhooks. Done via injected CSS so we
+# don't have to find/patch minified React component IDs.
+FRONT_INDEX=$(find /app/packages/twenty-server/dist -name "index.html" 2>/dev/null | head -1)
+if [ -z "$FRONT_INDEX" ]; then
+  FRONT_INDEX=$(find /app -name "index.html" -path "*/dist/*" 2>/dev/null | head -1)
+fi
+if [ -n "$FRONT_INDEX" ]; then
+  echo "=== Patching frontend index.html: $FRONT_INDEX ==="
+  # Idempotent: only inject if our marker isn't already there
+  if ! grep -q "twenty-patched-ui" "$FRONT_INDEX"; then
+    sed -i 's|</head>|<style id="twenty-patched-ui">a[href*="docs.twenty.com"]{display:none!important}a[href*="docs.twenty.com"] *{display:none!important}[class*="ApiKeysAndWebhooks"] img,[class*="SettingsApiKeys"] img,div[class*="EmptyState"] img,div[class*="Illustration"] img{display:none!important}</style></head>|' "$FRONT_INDEX"
+    echo "Injected CSS into $FRONT_INDEX"
+  else
+    echo "CSS already present, skipping"
+  fi
+else
+  echo "WARN: frontend index.html not found"
+fi
+
 echo "=== Patch complete ==="
