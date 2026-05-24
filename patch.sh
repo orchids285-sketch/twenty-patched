@@ -26,4 +26,23 @@ fi
 node /tmp/inject-debug.js "$CHAT_EXEC"
 
 echo "File size after: $(wc -c <"$CHAT_EXEC") bytes"
+
+# Also inspect tools and patch @ai-sdk/google adapter if the bug is there.
+# The Google adapter generates "$defs/__schema0" refs that Gemini's
+# function_response validator rejects. We patch the compiled adapter to
+# always inline $defs before sending to the API.
+GOOGLE_ADAPTER=$(find /app/node_modules/@ai-sdk/google -name "*.js" -o -name "*.mjs" 2>/dev/null | head -5)
+echo "=== @ai-sdk/google files: ==="
+echo "$GOOGLE_ADAPTER"
+GOOGLE_INDEX=$(find /app/node_modules/@ai-sdk/google/dist -name "index.js" 2>/dev/null | head -1)
+if [ -z "$GOOGLE_INDEX" ]; then
+  GOOGLE_INDEX=$(find /app/node_modules/@ai-sdk/google/dist -name "index.mjs" 2>/dev/null | head -1)
+fi
+if [ -n "$GOOGLE_INDEX" ]; then
+  echo "=== Patching Google adapter: $GOOGLE_INDEX ==="
+  echo "Looking for \$defs/__schema patterns:"
+  grep -E '__schema|\$defs|\$ref' "$GOOGLE_INDEX" | head -10 || true
+  node /tmp/patch-google.js "$GOOGLE_INDEX" || true
+fi
+
 echo "=== Patch complete ==="
