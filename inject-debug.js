@@ -72,5 +72,17 @@ checkpoints.forEach((re, idx) => {
   else console.log('[inject] SKIPPED CKPT-' + (idx + 1) + ' ' + labels[idx]);
 });
 
+// 3. Remove `tools: activeTools,` from streamText() call — Gemini chokes on
+//    $defs in tool schemas (known SDK bug). Without tools chat works for Q&A.
+//    The model can still answer general questions; tool-call ability is lost
+//    until the upstream schema bug is fixed.
+const toolsStripped = src.replace(/tools:\s*activeTools\s*,/g, '/* tools stripped */');
+if (toolsStripped !== src) {
+  src = toolsStripped;
+  console.log('[inject] stripped tools: activeTools from streamText calls');
+} else {
+  console.log('[inject] WARN: could not find tools:activeTools to strip');
+}
+
 fs.writeFileSync(path, src);
 console.log('[inject] file size ' + before + ' -> ' + src.length + ', ' + n + ' checkpoints + wrapper');
