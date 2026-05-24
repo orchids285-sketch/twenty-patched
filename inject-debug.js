@@ -72,16 +72,65 @@ checkpoints.forEach((re, idx) => {
   else console.log('[inject] SKIPPED CKPT-' + (idx + 1) + ' ' + labels[idx]);
 });
 
-// 3. Remove `tools: activeTools,` from streamText() call — Gemini chokes on
-//    $defs in tool schemas (known SDK bug). Without tools chat works for Q&A.
-//    The model can still answer general questions; tool-call ability is lost
-//    until the upstream schema bug is fixed.
-const toolsStripped = src.replace(/tools:\s*activeTools\s*,/g, '/* tools stripped */');
-if (toolsStripped !== src) {
-  src = toolsStripped;
-  console.log('[inject] stripped tools: activeTools from streamText calls');
+// 3. INLINE $defs in tool schemas before passing to streamText.
+//    Gemini rejects "$ref": "#/$defs/X" references — we walk each tool's
+//    inputSchema, resolve any $ref against $defs, and strip the top-level
+//    $defs block. This keeps tools functional (find_people, create_record,
+//    etc.) instead of stripping them entirely.
+const inlinerHelper = `
+// --- TwentyPatch: inline $defs in tool schemas (Gemini compat) ---
+function __twentyInlineDefs(schema, defs) {
+  if (!schema || typeof schema !== 'object') return schema;
+  if (Array.isArray(schema)) return schema.map(function (x) { return __twentyInlineDefs(x, defs); });
+  // Resolve $ref against $defs
+  if (typeof schema.$ref === 'string') {
+    var m = schema.$ref.match(/^#\\/\\$defs\\/(.+)$/);
+    if (m && defs && defs[m[1]]) {
+      // Inline the referenced def (recursively resolve in case of chains)
+      return __twentyInlineDefs(defs[m[1]], defs);
+    }
+  }
+  var out = {};
+  for (var k in schema) {
+    if (k === '$defs' || k === 'definitions') continue;
+    out[k] = __twentyInlineDefs(schema[k], defs);
+  }
+  return out;
+}
+function __twentyFlattenToolSchemas(tools) {
+  if (!tools || typeof tools !== 'object') return tools;
+  var out = {};
+  var n = 0;
+  for (var name in tools) {
+    var t = tools[name];
+    if (t && typeof t === 'object' && t.inputSchema && typeof t.inputSchema === 'object') {
+      var defs = t.inputSchema.$defs || t.inputSchema.definitions || {};
+      var flat = __twentyInlineDefs(t.inputSchema, defs);
+      out[name] = Object.assign({}, t, { inputSchema: flat });
+      n++;
+    } else {
+      out[name] = t;
+    }
+  }
+  console.log("[TwentyPatch] flattened $defs in " + n + " tool schemas");
+  return out;
+}
+// --- end TwentyPatch helper ---
+`;
+
+// Insert helper at the top of the file (after the first "use strict" or after imports)
+src = inlinerHelper + src;
+
+// Replace tools: activeTools with the flattened version
+const toolsFlattened = src.replace(
+  /tools:\s*activeTools\s*,/g,
+  'tools: __twentyFlattenToolSchemas(activeTools),'
+);
+if (toolsFlattened !== src) {
+  src = toolsFlattened;
+  console.log('[inject] wrapped tools: activeTools with __twentyFlattenToolSchemas');
 } else {
-  console.log('[inject] WARN: could not find tools:activeTools to strip');
+  console.log('[inject] WARN: could not find tools:activeTools to wrap');
 }
 
 fs.writeFileSync(path, src);
