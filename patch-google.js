@@ -19,10 +19,11 @@ console.log('[google-patch] file size: ' + before);
 
 const helper = `
 "use strict";
-function __googleInlineDefs(schema, defs, seen) {
-  if (!schema || typeof schema !== 'object') return schema;
+function __googleInlineDefs(schema, defs, seen, depth) {
+  depth = depth || 0;
+  if (depth > 60 || !schema || typeof schema !== 'object') return schema;
   if (Array.isArray(schema)) {
-    for (var i=0;i<schema.length;i++) schema[i] = __googleInlineDefs(schema[i], defs, seen);
+    for (var i=0;i<schema.length;i++) schema[i] = __googleInlineDefs(schema[i], defs, seen, depth+1);
     return schema;
   }
   if (typeof schema.$ref === 'string') {
@@ -34,14 +35,14 @@ function __googleInlineDefs(schema, defs, seen) {
       var target = defs[m[1]];
       delete schema.$ref;
       for (var tk in target) schema[tk] = target[tk];
-      __googleInlineDefs(schema, defs, seen);
+      __googleInlineDefs(schema, defs, seen, depth+1);
       seen[key] = false;
       return schema;
     }
   }
   for (var k in schema) {
     if (k === '$defs' || k === 'definitions') continue;
-    schema[k] = __googleInlineDefs(schema[k], defs, seen);
+    schema[k] = __googleInlineDefs(schema[k], defs, seen, depth+1);
   }
   return schema;
 }
@@ -63,9 +64,12 @@ JSON.stringify = function(value, replacer, space) {
     if (value && typeof value === 'object' && (value.$defs || value.definitions)) {
       // Deep-clone first via parse(stringify(original-defs)) so we don't
       // mutate the caller's object permanently
-      var clone = JSON.parse(__origStringify(value));
-      __googleFlattenAll(clone);
-      return __origStringify(clone, replacer, space);
+      var __orig = __origStringify(value);
+      if (__orig.length <= 40000) {
+        var clone = JSON.parse(__orig);
+        __googleFlattenAll(clone);
+        return __origStringify(clone, replacer, space);
+      }
     }
   } catch (e) {}
   return __origStringify.apply(this, arguments);
